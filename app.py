@@ -1,14 +1,71 @@
-# ...весь твой импорт и инициализация как было
+import os
+import time
+import asyncio
+from openai import OpenAI
+import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
+from telegram import Bot
+
+client = OpenAI()
+vk_token     = os.getenv("VK_API_TOKEN")
+assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
+
+# Telegram
+tg_bot_token = os.getenv("TG_BOT_TOKEN")
+shuvi_chat_id = os.getenv("SHUVI_CHAT_ID")
+tg_bot = Bot(token=tg_bot_token)
+
+if not vk_token or not assistant_id:
+    raise ValueError("❌ Нет VK_API_TOKEN или OPENAI_ASSISTANT_ID в переменных Railway")
+if not tg_bot_token or not shuvi_chat_id:
+    raise ValueError("❌ Нет TG_BOT_TOKEN или SHUVI_CHAT_ID в переменных Railway")
+
+vk_session = vk_api.VkApi(token=vk_token)
+vk         = vk_session.get_api()
+longpoll   = VkLongPoll(vk_session)    # <= ВАЖНО: инициализация до try!
+
+user_last_message_time = {}
+user_threads           = {}
+active_users           = {}
+RESPONSE_COOLDOWN      = 5
+SESSION_TIMEOUT        = 30 * 60
+
+def send_vk_message(user_id: int, text: str):
+    vk.messages.send(user_id=user_id,
+                     message=text,
+                     random_id=int(time.time() * 1_000_000))
+
+def send_telegram_message(chat_id, text):
+    async def _send():
+        await tg_bot.send_message(chat_id=chat_id, text=text)
+    try:
+        # Если уже есть event loop (например, если ты где-то внутри async-кода)
+        asyncio.get_running_loop().create_task(_send())
+    except RuntimeError:
+        # Если вызываешь из обычного sync-кода
+        asyncio.run(_send())
+
+def is_active(user_id):
+    if user_id in active_users:
+        if time.time() - active_users[user_id] < SESSION_TIMEOUT:
+            return True
+        else:
+            del active_users[user_id]
+    return False
+
+PING_PHRASES = [
+    "позови алекса", "позвать алекса", "зовите алекса", "человек", "кожанный мешок", "Позови человека",
+    "позвать владельца", "позвать директора"
+]
 
 print("🟢 Шуви запущена и слушает ВКонтакте…")
 
 try:
-    print("Перед longpoll.listen()")  # <--- Дебаг: доходим до запуска longpoll
+    print("Перед longpoll.listen()")
     for event in longpoll.listen():
-        print("Что-то пришло!")        # <--- Дебаг: пришло хоть одно событие
-
+        print("Что-то пришло!")
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            print(f"Новое сообщение от {event.user_id}: {event.text}")  # <--- Дебаг сообщения
+            print(f"Новое сообщение от {event.user_id}: {event.text}")
             user_id  = event.user_id
             user_msg = event.text.strip()
 
@@ -65,7 +122,7 @@ try:
             except Exception as e:
                 send_vk_message(user_id, "Произошла ошибка. Попробуйте позже.")
                 print("❌ Ошибка (внутри обработки сообщения):", e)
-    print("Цикл завершился")  # <--- Если увидишь это, значит longpoll оборвался
+    print("Цикл завершился")
 
 except Exception as global_e:
     print("!!! GLOBAL ERROR:", global_e)
