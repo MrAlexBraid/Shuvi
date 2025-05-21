@@ -27,17 +27,16 @@ longpoll   = VkLongPoll(vk_session)
 user_last_message_time = {}
 user_threads           = {}
 active_users           = {}
+feedback_states        = {}   # user_id: {"step": 1, ...}
+feedback_answers       = {}   # user_id: {step1:..., step2:...}
+
 RESPONSE_COOLDOWN      = 5
 SESSION_TIMEOUT        = 30 * 60
 
 def send_vk_message(user_id: int, text: str):
-    try:
-        vk.messages.send(user_id=user_id,
-                         message=text,
-                         random_id=int(time.time() * 1_000_000))
-        print(f"[VK] Сообщение отправлено {user_id}: {text[:30]}")
-    except Exception as e:
-        print(f"[VK] Ошибка отправки сообщения {user_id}: {e}")
+    vk.messages.send(user_id=user_id,
+                     message=text,
+                     random_id=int(time.time() * 1_000_000))
 
 def send_telegram_message(chat_id, text):
     async def _send():
@@ -60,80 +59,106 @@ PING_PHRASES = [
     "позвать владельца", "позвать директора"
 ]
 
+FEEDBACK_KEYWORDS = ["фидбек", "отзыв", "feedback", "review"]
+
+# Вопросы для сбора фидбека
+FEEDBACK_QUESTIONS = [
+    "Ваше имя?",
+    "Какие функции вы бы хотели увидеть в ИИ ассистенте?",
+    "Как вы оцениваете демо-версию ИИ ассистента?",
+    "Что вам НЕ понравилось или показалось неудобным?"
+]
+
 print("🟢 Шуви запущена и слушает ВКонтакте…")
 
-try:
-    print("Перед longpoll.listen()")
-    for event in longpoll.listen():
-        print("Что-то пришло!")
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            print(f"Новое сообщение от {event.user_id}: {event.text}")
-            user_id  = event.user_id
-            user_msg = event.text.strip()
+for event in longpoll.listen():
+    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+        user_id  = event.user_id
+        user_msg = event.text.strip()
 
-            now, last = time.time(), user_last_message_time.get(user_id, 0)
-            if now - last < RESPONSE_COOLDOWN:
-                print(f"[COOLDOWN] Пропуск ответа для {user_id}")
-                continue
-            user_last_message_time[user_id] = now
+        now, last = time.time(), user_last_message_time.get(user_id, 0)
+        if now - last < RESPONSE_COOLDOWN:
+            continue
+        user_last_message_time[user_id] = now
 
-            if any(phrase in user_msg.lower() for phrase in PING_PHRASES):
-                print("[PING] Пинг админа!")
-                send_telegram_message(
-                    shuvi_chat_id,
-                    f"Вас зовут в чатике VK!\nUser: vk.com/id{user_id}\nСообщение: {user_msg}"
-                )
-                send_vk_message(
-                    user_id,
-                    "Алексу отправлено уведомление, он скоро напишет Вам. Сессия завершена. Чтобы снова начать, напиши 'Шуви'"
-                )
-                if user_id in active_users:
-                    del active_users[user_id]
-                continue
+        # ---------- ФИДБЕК ----------
+        # Если пользователь в режиме фидбека - обрабатываем отдельной логикой
+        if user_id in feedback_states:
+            step = feedback_states[user_id]["step"]
+            if user_id not in feedback_answers:
+                feedback_answers[user_id] = {}
+            feedback_answers[user_id][step] = user_msg
 
-            if is_active(user_id):
-                print("[STATE] Пользователь активен, отвечаю")
-                if user_msg.lower() in ["стоп", "пока", "отключиться"]:
-                    del active_users[user_id]
-                    send_vk_message(user_id, "Сессия завершена. Чтобы снова начать, напиши 'Шуви'.")
-                    continue
-                else:
-                    active_users[user_id] = now
+            if step < len(FEEDBACK_QUESTIONS):
+                feedback_states[user_id]["step"] += 1
+                send_vk_message(user_id, FEEDBACK_QUESTIONS[step])
             else:
-                if "шуви" in user_msg.lower():
-                    print("[ACTIVATE] Активация Шуви для пользователя")
-                    active_users[user_id] = now
-                    send_vk_message(user_id, "Шуви активирован! Теперь отвечаю на любые сообщения. Чтобы завершить — напиши 'Стоп' или 'Пока'.")
-                else:
-                    print("[NO ACTIVATE] Сообщение вне активации Шуви")
-                    continue
+                # Завершили опрос — отправляем админу
+                summary = f"📝 Новый фидбек из VK!\n" \
+                          f"User: vk.com/id{user_id}\n"
+                for i, q in enumerate(FEEDBACK_QUESTIONS):
+                    summary += f"\n{q}\n{feedback_answers[user_id].get(i+1, '-')}\n"
+                send_telegram_message(shuvi_chat_id, summary)
+                send_vk_message(user_id, "Спасибо за фидбек! ❤️ Ваши ответы переданы команде.")
+                del feedback_states[user_id]
+                del feedback_answers[user_id]
+            continue
 
-            try:
-                print("[OPENAI] Пробую создать thread для OpenAI")
-                thread_id = user_threads.setdefault(
-                    user_id, client.beta.threads.create().id
-                )
-                print("[OPENAI] Отправляю сообщение в thread")
-                client.beta.threads.messages.create(
-                    thread_id=thread_id, role="user", content=user_msg
-                )
-                print("[OPENAI] Запускаю run")
-                run = client.beta.threads.runs.create(
-                    thread_id=thread_id, assistant_id=assistant_id
-                )
-                while client.beta.threads.runs.retrieve(
-                    thread_id=thread_id, run_id=run.id
-                ).status != "completed":
-                    print("[OPENAI] Ожидание завершения run...")
-                    time.sleep(1)
-                reply = client.beta.threads.messages.list(
-                    thread_id=thread_id
-                ).data[0].content[0].text.value
-                print(f"[OPENAI] Получен ответ: {reply[:40]}... Отправляю в VK")
-                send_vk_message(user_id, reply)
-            except Exception as e:
-                send_vk_message(user_id, "Произошла ошибка. Попробуйте позже.")
-                print("❌ Ошибка (внутри обработки сообщения):", e)
-    print("Цикл завершился")
-except Exception as global_e:
-    print("!!! GLOBAL ERROR:", global_e)
+        # Запуск фидбека по ключевому слову
+        if any(word in user_msg.lower() for word in FEEDBACK_KEYWORDS):
+            feedback_states[user_id] = {"step": 1}
+            feedback_answers[user_id] = {}
+            send_vk_message(user_id, "Давай соберём фидбек по ассистенту. Отвечай по порядку:")
+            send_vk_message(user_id, FEEDBACK_QUESTIONS[0])
+            continue
+
+        # ---------- КОНЕЦ ФИДБЕКА ----------
+
+        if any(phrase in user_msg.lower() for phrase in PING_PHRASES):
+            send_telegram_message(
+                shuvi_chat_id,
+                f"Вас зовут в чатике VK!\nUser: vk.com/id{user_id}\nСообщение: {user_msg}"
+            )
+            send_vk_message(
+                user_id,
+                "Алексу отправлено уведомление, он скоро напишет Вам. Сессия завершена. Чтобы снова начать, напиши 'Шуви'"
+            )
+            if user_id in active_users:
+                del active_users[user_id]
+            continue
+
+        if is_active(user_id):
+            if user_msg.lower() in ["стоп", "пока", "отключиться"]:
+                del active_users[user_id]
+                send_vk_message(user_id, "Сессия завершена. Чтобы снова начать, напиши 'Шуви'.")
+                continue
+            else:
+                active_users[user_id] = now
+        else:
+            if "шуви" in user_msg.lower():
+                active_users[user_id] = now
+                send_vk_message(user_id, "Шуви активирован! Теперь отвечаю на любые сообщения. Чтобы завершить — напиши 'Стоп' или 'Пока'.")
+            else:
+                continue
+
+        try:
+            thread_id = user_threads.setdefault(
+                user_id, client.beta.threads.create().id
+            )
+            client.beta.threads.messages.create(
+                thread_id=thread_id, role="user", content=user_msg
+            )
+            run = client.beta.threads.runs.create(
+                thread_id=thread_id, assistant_id=assistant_id
+            )
+            while client.beta.threads.runs.retrieve(
+                thread_id=thread_id, run_id=run.id
+            ).status != "completed":
+                time.sleep(1)
+            reply = client.beta.threads.messages.list(
+                thread_id=thread_id
+            ).data[0].content[0].text.value
+            send_vk_message(user_id, reply)
+        except Exception as e:
+            send_vk_message(user_id, "Произошла ошибка. Попробуйте позже.")
+            print("❌ Ошибка:", e)
