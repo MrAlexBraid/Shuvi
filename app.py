@@ -22,7 +22,7 @@ if not tg_bot_token or not shuvi_chat_id:
 
 vk_session = vk_api.VkApi(token=vk_token)
 vk         = vk_session.get_api()
-longpoll   = VkLongPoll(vk_session)    # <= ВАЖНО: инициализация до try!
+longpoll   = VkLongPoll(vk_session)
 
 user_last_message_time = {}
 user_threads           = {}
@@ -31,18 +31,20 @@ RESPONSE_COOLDOWN      = 5
 SESSION_TIMEOUT        = 30 * 60
 
 def send_vk_message(user_id: int, text: str):
-    vk.messages.send(user_id=user_id,
-                     message=text,
-                     random_id=int(time.time() * 1_000_000))
+    try:
+        vk.messages.send(user_id=user_id,
+                         message=text,
+                         random_id=int(time.time() * 1_000_000))
+        print(f"[VK] Сообщение отправлено {user_id}: {text[:30]}")
+    except Exception as e:
+        print(f"[VK] Ошибка отправки сообщения {user_id}: {e}")
 
 def send_telegram_message(chat_id, text):
     async def _send():
         await tg_bot.send_message(chat_id=chat_id, text=text)
     try:
-        # Если уже есть event loop (например, если ты где-то внутри async-кода)
         asyncio.get_running_loop().create_task(_send())
     except RuntimeError:
-        # Если вызываешь из обычного sync-кода
         asyncio.run(_send())
 
 def is_active(user_id):
@@ -71,10 +73,12 @@ try:
 
             now, last = time.time(), user_last_message_time.get(user_id, 0)
             if now - last < RESPONSE_COOLDOWN:
+                print(f"[COOLDOWN] Пропуск ответа для {user_id}")
                 continue
             user_last_message_time[user_id] = now
 
             if any(phrase in user_msg.lower() for phrase in PING_PHRASES):
+                print("[PING] Пинг админа!")
                 send_telegram_message(
                     shuvi_chat_id,
                     f"Вас зовут в чатике VK!\nUser: vk.com/id{user_id}\nСообщение: {user_msg}"
@@ -88,6 +92,7 @@ try:
                 continue
 
             if is_active(user_id):
+                print("[STATE] Пользователь активен, отвечаю")
                 if user_msg.lower() in ["стоп", "пока", "отключиться"]:
                     del active_users[user_id]
                     send_vk_message(user_id, "Сессия завершена. Чтобы снова начать, напиши 'Шуви'.")
@@ -95,34 +100,40 @@ try:
                 else:
                     active_users[user_id] = now
             else:
-                if "Шуви" in user_msg.lower():
+                if "шуви" in user_msg.lower():
+                    print("[ACTIVATE] Активация Шуви для пользователя")
                     active_users[user_id] = now
                     send_vk_message(user_id, "Шуви активирован! Теперь отвечаю на любые сообщения. Чтобы завершить — напиши 'Стоп' или 'Пока'.")
                 else:
+                    print("[NO ACTIVATE] Сообщение вне активации Шуви")
                     continue
 
             try:
+                print("[OPENAI] Пробую создать thread для OpenAI")
                 thread_id = user_threads.setdefault(
                     user_id, client.beta.threads.create().id
                 )
+                print("[OPENAI] Отправляю сообщение в thread")
                 client.beta.threads.messages.create(
                     thread_id=thread_id, role="user", content=user_msg
                 )
+                print("[OPENAI] Запускаю run")
                 run = client.beta.threads.runs.create(
                     thread_id=thread_id, assistant_id=assistant_id
                 )
                 while client.beta.threads.runs.retrieve(
                     thread_id=thread_id, run_id=run.id
                 ).status != "completed":
+                    print("[OPENAI] Ожидание завершения run...")
                     time.sleep(1)
                 reply = client.beta.threads.messages.list(
                     thread_id=thread_id
                 ).data[0].content[0].text.value
+                print(f"[OPENAI] Получен ответ: {reply[:40]}... Отправляю в VK")
                 send_vk_message(user_id, reply)
             except Exception as e:
                 send_vk_message(user_id, "Произошла ошибка. Попробуйте позже.")
                 print("❌ Ошибка (внутри обработки сообщения):", e)
     print("Цикл завершился")
-
 except Exception as global_e:
     print("!!! GLOBAL ERROR:", global_e)
